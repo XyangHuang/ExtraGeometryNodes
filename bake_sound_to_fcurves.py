@@ -131,6 +131,8 @@ def bake_sound(n=1, scale=1):
     bpy.context.scene.frame_current = 1
     
     obj = bpy.context.active_object
+    # if not insert a keyframe, the animation_data will be None
+    obj.keyframe_insert(data_path="location", frame=1, index=1)
     
     area_type = bpy.context.area.type
     bpy.context.area.type = 'GRAPH_EDITOR'
