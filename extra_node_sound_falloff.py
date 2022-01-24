@@ -133,6 +133,9 @@ def create_new_nodegroup(name, sockets={}):
     for socket_name, socket_type in sockets.items():
         create_socket(ng, socket_type=socket_type, socket_name=socket_name)
 
+    # TODO now only support extra_node_sequencer_volume.py
+    ng.inputs.new('NodeSocketFloat', 'volume')
+
     return ng
 
 
@@ -163,14 +166,18 @@ class EXTRANODESOUNDFALLOFF_NG_sound_falloff(bpy.types.GeometryNodeCustomGroup):
 
     debug_update_counter: bpy.props.IntProperty()  # visual aid debug
 
-    # 物体选择
-    def source_obj_poll(self, obj):
-        return True if obj.type == "MESH" else False
-    source_obj: bpy.props.PointerProperty(type=bpy.types.Object, poll=source_obj_poll)
+    current_obj: bpy.props.PointerProperty(type=bpy.types.Object)
 
-    # use_scene_cam: bpy.props.BoolProperty(default=True) # 是否使用场景相机
-    sound_freq_index: bpy.props.IntProperty(default=0,min=0)
-    frame_delay: bpy.props.IntProperty(default=0,min=0)
+    volume_fac: bpy.props.FloatProperty(default=1, min=0.1, max=100)
+    enable_gravity: bpy.props.BoolProperty()
+    gravity_fac: bpy.props.FloatProperty(default=1, min=0.1, max=100)
+    enable_bounce: bpy.props.BoolProperty()
+    max_bounce_height: bpy.props.FloatProperty(default=0.1,min=0, max=10)
+
+    # inner params for calculating gravity and bounce
+    last_frame: bpy.props.IntProperty(default=0,min=0)
+    last_speed: bpy.props.FloatProperty(default=0, min=0)  # height per frame
+    last_z: bpy.props.FloatProperty(default=0, min=0)
 
     # sound: bpy.props.PointerProperty(type=bpy.types.Sound) #,poll=sound_poll)
 
@@ -181,20 +188,20 @@ class EXTRANODESOUNDFALLOFF_NG_sound_falloff(bpy.types.GeometryNodeCustomGroup):
     def init(self, context):
         """this fct run when appending the node for the first time"""
 
-        # 初始化输出节点
         name = f".{self.bl_idname}"
         if name not in bpy.data.node_groups.keys():
             ng = create_new_nodegroup(name, sockets={
-                "Source Object" : "NodeSocketObject",
-                "Index" : "NodeSocketInt",
-                "Sound Falloff" : "NodeSocketFloat",
-                "Sound Gravity FallOff" : "NodeSocketFloat",
+                "Falloff" : "NodeSocketFloat",
+                "Gravity FallOff" : "NodeSocketFloat",
             })
-        else: # 如果有就复制一份
+        else:
             ng = bpy.data.node_groups[name].copy()
 
         self.node_tree = ng
         self.label = self.bl_label
+
+        # get obj of this node
+        self.current_obj = self.get_current_obj()
 
         # mark an update signal so handler fct do not need to loop every single nodegroups
         bpy.context.space_data.node_tree["extra_node_sound_falloff_update_needed"] = True
@@ -208,28 +215,74 @@ class EXTRANODESOUNDFALLOFF_NG_sound_falloff(bpy.types.GeometryNodeCustomGroup):
 
     def update(self):
         """generic update function"""
-        src_obj = self.source_obj
-        set_socket_value(self.node_tree, 0, src_obj)
-        set_socket_value(self.node_tree, 1, self.sound_freq_index)
-        if src_obj and src_obj.animation_data and src_obj.animation_data.action:
-            fcurves = src_obj.animation_data.action.fcurves
-            fcurvesCount = len(fcurves)
+        frame = bpy.context.scene.frame_current  # + self.frame_delay
 
-            fcurve_index = self.sound_freq_index * 2
-            fcurve_gravity_index = fcurve_index + 1
+        value = 0
+        # TODO maybe current_node can be moved to init(), but don't know how to register the param
+        current_node = self.get_current_node()
+        if current_node is not None:
+            if current_node.inputs[0].is_linked:
+                # TODO now only support extra_node_sequencer_volume.py
+                value = current_node.inputs[0].links[0].from_socket.node.node_tree.nodes["Group Output"].inputs[0].default_value
+            else:
+                value = current_node.inputs[0].default_value
 
-            if fcurve_gravity_index < fcurvesCount:
-                frame = bpy.context.scene.frame_current - self.frame_delay
+        current_z = value * self.volume_fac
+        if not self.enable_gravity:
+            set_socket_value(self.node_tree, 0, current_z)
+            set_socket_value(self.node_tree, 1, current_z)
+            self.last_z = current_z
+            self.last_frame = frame
+            self.last_speed = 0
+        else:
+            set_socket_value(self.node_tree, 0, current_z)
+            # if not bpy.context.screen.is_animation_playing:
+            if frame < self.last_frame:
+                set_socket_value(self.node_tree, 1, current_z)
+                self.last_z = current_z
+                self.last_frame = frame
+                self.last_speed = 0
+            else:
+                diff_frame = frame - self.last_frame
+                # if diff_frame < 0:
+                #     diff_frame = 0
+                gravity_z = self.last_z - 9.8 * self.gravity_fac * diff_frame * diff_frame / 1800
 
-                if frame < 0 or frame >= len(fcurves[fcurve_index].sampled_points) or frame >= len(fcurves[fcurve_gravity_index].sampled_points):
-                    set_socket_value(self.node_tree, 2, 0)
-                    set_socket_value(self.node_tree, 3, 0)
+                if self.enable_bounce:
+                    gravity_z = gravity_z + self.last_speed * diff_frame
+
+                if gravity_z >= current_z:
+                    set_socket_value(self.node_tree, 1, gravity_z)
                 else:
-                    set_socket_value(self.node_tree, 2, fcurves[fcurve_index].sampled_points[frame].co[1])
-                    set_socket_value(self.node_tree, 3, fcurves[fcurve_gravity_index].sampled_points[frame].co[1])
+                    set_socket_value(self.node_tree, 1, current_z)
+                    self.last_z = current_z
+                    self.last_frame = frame
+                    self.last_speed = min(current_z - gravity_z, self.max_bounce_height)
 
         self.debug_update_counter += 1
         return None
+
+    def get_current_obj(self):
+        for obj in bpy.data.objects:
+            for mod in obj.modifiers:
+                if mod.type == 'NODES' and mod.node_group.type == 'GEOMETRY':
+                    for node in mod.node_group.nodes:
+                        if hasattr(node, 'node_tree') and node.node_tree.name == self.node_tree.name:
+                            return obj
+        return None
+
+    def get_current_node(self):
+        if self.current_obj is None:
+            return None
+
+        for mod in self.current_obj.modifiers:
+            if mod.type == 'NODES' and mod.node_group.type == 'GEOMETRY':
+                for node in mod.node_group.nodes:
+                    if hasattr(node, 'node_tree') and node.node_tree.name == self.node_tree.name:
+                        return node
+
+        return None
+
 
     # def socket_value_update(self,context):
     #    """dead api, revive me please?"""
@@ -243,17 +296,16 @@ class EXTRANODESOUNDFALLOFF_NG_sound_falloff(bpy.types.GeometryNodeCustomGroup):
         """node interface drawing"""
 
         row = layout.row(align=True)
-        sub = row.row(align=True)
-        sub.prop(self, "source_obj", text="", icon="OBJECT_DATA")
-        # row = layout.row(align=True)
-        # sub = row.row(align=True)
-        # sub.prop(self, "sound", text="", icon="SOUND")
-        row = layout.row(align=True)
-        sub = row.row(align=True)
-        sub.prop(self, "sound_freq_index", text="Index")
-        row = layout.row(align=True)
-        sub = row.row(align=True)
-        sub.prop(self, "frame_delay", text="Frame Delay")
+        row.prop(self, "volume_fac", text="Volume Fac")
+
+        box = layout.box()
+        box.active = self.enable_gravity
+        sub = box.row(align=True)
+        sub.prop(self, "enable_gravity", text="Gravity", icon="WORLD")
+        sub.prop(self, "gravity_fac", text="Fac")
+        sub = box.row(align=True)
+        sub.prop(self, "enable_bounce", text="Bounce", icon="MOD_PHYSICS")
+        sub.prop(self, "max_bounce_height", text="Max")
 
         if bpy.context.preferences.addons["extra_node_sound_falloff"].preferences.debug:
             box = layout.column()
